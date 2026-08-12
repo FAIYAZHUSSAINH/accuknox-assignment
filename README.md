@@ -9,4 +9,4 @@
 | 3 | Import a CSV of user info into SQLite | [`q3_csv_import/`](q3_csv_import/) — see its [README](q3_csv_import/README.md) for the full write-up: a BOM bug reproduced and fixed, a naive all-or-nothing insert that dropped an entire good batch because of one bad row and the validate-first fix, and case-insensitive email dedup carried over from Q1. |
 
 The original written submission (PDF, with screenshots) is on Google Drive : https://drive.google.com/drive/folders/1iuHjBjBw6iG-b9pHds8GTxgC9Pi-18Ct?usp=sharing
-ASSIGNMENT 2 - GOOGLE DRIVE LINK : https://drive.google.com/file/d/1c7JpYQmKhLKiuJ6mos_mqna012npeG2F/view?usp=sharing
+                                            ASSIGNMENT 2 - GOOGLE DRIVE LINK : https://drive.google.com/file/d/1c7JpYQmKhLKiuJ6mos_mqna012npeG2F/view?usp=sharing
