@@ -165,4 +165,5 @@ Python Programming - Vijaya Kumara Sarma, Vimal Kumar, Swati Sharma, Shashwat Pa
 ```
 
 The full written submission (with screenshots of the API response, the exploration
-script output, and the SQLite table view) is in [`docs/AI_ML Q1.pdf`](../docs/AI_ML%20Q1.pdf).
+script output, and the SQLite table view) is on Google Drive:
+https://drive.google.com/drive/folders/1iuHjBjBw6iG-b9pHds8GTxgC9Pi-18Ct?usp=sharing
