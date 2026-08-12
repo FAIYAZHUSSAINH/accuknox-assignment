@@ -3,188 +3,117 @@
 > Write a Python script that reads data from a CSV file containing user information
 > (e.g., name, email) and inserts it into a SQLite database.
 
-## What I built
+**What I built**
 
-| File | Purpose |
-|---|---|
-| [`make_fixture.py`](make_fixture.py) | Generates `users.csv` — test fixture, not the assessed part. |
-| [`csv_import.py`](csv_import.py) | The actual answer: read → validate → store → display. |
+`csv_import.py` reads a CSV of user records, validates each row, and inserts the valid
+ones into SQLite. Structured as `read_users` → `validate_users` → `init_db` /
+`save_users` → `display_users`. `make_fixture.py` generates the test data — a fixture,
+not the assessed part.
 
-No third-party dependencies. `csv` and `sqlite3` are both stdlib, and nothing about a
-name/email import needed more than that — see the `pandas` note at the bottom.
+I generated the fixture deliberately dirty — duplicate rows, case-variant email, padded
+whitespace, a non-ASCII name, a malformed email, a missing name, a missing email, a
+ragged row, and a UTF-8 BOM — because clean input leaves the error handling untested.
 
-## The fixture — generated, not typed
+**The BOM**
 
-`make_fixture.py` writes 11 data rows, deliberately seeding **nine** problems into an
-11-row file — small enough to read in one glance, but built so a naive script fails
-loudly instead of quietly getting the wrong answer.
+The file was written the way Excel writes UTF-8 CSVs, with a byte-order mark. Reading it
+with `encoding="utf-8"` produced `fieldnames == ['﻿name', 'email']`, so
+`row["name"]` raised `KeyError` while a printed header still looked like `name`. I
+confirmed the BOM at byte level (`b'\xef\xbb\xbfnam...'`) before changing the parser,
+then fixed it with `encoding="utf-8-sig"`, which strips it.
 
-## Problem #1: the BOM (found by trying the wrong thing first)
+This is worth calling out because the failure is invisible in a text editor and the
+error message points at the wrong thing.
 
-`make_fixture.py` writes with `encoding="utf-8-sig"`, which is what Excel does when you
-"Save As → CSV UTF-8" — it prefixes the file with a byte-order mark. Read that file back
-with plain `"utf-8"` and:
+**Why the transaction strategy changed from Q1**
 
-```python
->>> reader = csv.DictReader(open("users.csv", encoding="utf-8"))
->>> reader.fieldnames
-['﻿name', 'email']
->>> next(reader)["name"]
-KeyError: 'name'
-```
+In Q1 I wrapped `executemany` in a single all-or-nothing transaction. That was right
+there: every row came from one API response, so a partial write would have stored an
+incoherent snapshot.
 
-The header *prints* as `name` — it looks completely normal in a text editor or in
-`print(fieldnames)` if you're not looking closely — but the key is actually `'﻿name'`,
-so any `row["name"]` lookup raises `KeyError`. Confirmed the raw bytes first
-(`b'\xef\xbb\xbfnam...'`) so I knew the BOM was really there before blaming my code.
-Fixed with `encoding="utf-8-sig"` in `read_users`, which strips it — verified `fieldnames`
-comes back as `['name', 'email']` afterward. Probably the single most common real-world
-CSV bug, and it's invisible until you go looking for it.
+I tested whether the same pattern held here by feeding raw, unvalidated tuples straight
+into `executemany` inside one transaction. It raised
+`ProgrammingError: Incorrect number of bindings supplied` on the ragged row — and
+**zero rows were inserted**, not ten valid ones and one rejection. One malformed line at
+the end of a file discards everything before it.
 
-## The other eight problems
+That's the wrong behaviour for a bulk import. A user file is a set of independent
+records, not a single atomic snapshot, and a real 10,000-row import shouldn't be
+destroyed by one bad line at row 8,000.
 
-| line | row | issue |
-|---|---|---|
-| 3 | Bharath Kumar, `BHARATH.KUMAR@EXAMPLE.COM` | uppercase email |
-| 4 | Chitra Devi, `"  chitra.devi@example.com  "` | whitespace padding |
-| 5 | José Fernandes, jose.fernandes@example.com | non-ASCII name |
-| 6 | Elango S, `elango.example.com` | malformed email (no `@`) |
-| 7 | Fathima Begum, *(empty)* | missing email |
-| 8 | *(empty)*, ganesh.iyer@example.com | missing name |
-| 10 | Aarthi Raman, aarthi.raman@example.com | exact duplicate of line 2 |
-| 11 | Janani P, janani.p@example.com, `9876543210` | ragged row — 3 fields, header declares 2 |
+So the pipeline validates first and inserts only clean rows. Rejected rows are reported
+with their reason and line number rather than dropped silently — if records disappear
+between the file and the database, that has to be visible.
 
-One thing I checked rather than assumed: the fixture does **not** actually contain a
-*matching* case-variant pair. Bharath's row is uppercase, but nothing else in the file
-shares his email in a different case — so on its own, this dataset never exercises
-whether the dedup logic actually catches a case collision, only that normalization
-doesn't crash on an uppercase value. I tested that separately — see below.
+The same tool was correct in Q1 and wrong here. What changed is whether the rows are one
+unit of meaning or many.
 
-## The decision that matters most: transaction strategy is not "same as Q1"
+**Results**
 
-Q1 wrapped `executemany` in `with conn:` for all-or-nothing inserts, and that was right
-*there* — every row came from one API response, so a partial write would be an
-incoherent snapshot. I tried the same pattern here first, unchanged, to see if it still
-held.
+First run against an empty database: 11 rows read, 8 valid, 3 rejected (malformed email
+with no `@`, missing email, ragged row with three fields against a two-column header),
+7 inserted, 1 skipped as an exact duplicate.
 
-**Naive version:** pull `tuple(row.values())` straight off the raw `DictReader` rows and
-`executemany` them inside one transaction — no validation first.
+The 8 valid rows include Ganesh's — email present, name empty. That's the "missing
+email is fatal, missing name isn't" rule below being exercised, not a validator gap: his
+row can't be identified by name, but it's still a keyable, storable record by email, so
+it's counted in the 8, not the 3 rejections.
 
-```
-read 11 raw rows
-line 11 has 3 values instead of 2: ('Janani P', 'janani.p@example.com', ['9876543210'])
+Second run, same file, same database: 0 inserted, 8 skipped. Idempotent.
 
-executemany raised: ProgrammingError: Incorrect number of bindings supplied. The current
-statement uses 2, and there are 3 supplied.
-rows actually in the table after the failed batch: 0
-```
+**Validation decisions**
 
-**Zero rows landed** — not just Janani's, all 11, including the 8 that were perfectly
-fine. That's the concrete version of "a 10,000-row import with one bad row at line
-8,000": one ragged row killed the entire batch.
+*Email as the key.* Email is the natural identifier, so a row without one is rejected. A
+row with an email but no name is kept — the record is still identifiable and a name is a
+label rather than a key.
 
-**Fix:** it's not dropping the transaction, it's not letting a malformed row reach it in
-the first place. `validate_users` filters out anything that could break the insert
-*before* `save_users` ever sees it, so by the time rows reach `executemany`, "all rows"
-and "all good rows" are the same set — `with conn:` is still the right call, just on a
-pre-cleaned batch. The one thing validation deliberately doesn't handle is duplicates;
-`INSERT OR IGNORE` absorbs those without raising at all, which is a cleaner mechanism
-than a validation-time duplicate check would have been.
+*Whitespace* is stripped from both fields. Padding is a formatting artifact, and
+`"  x@y.com  "` and `"x@y.com"` are the same address.
 
-## Other decisions
+*Email validation* checks for exactly one `@` with content on both sides. Full RFC 5322
+compliance is effectively unachievable with a regex, and stricter validation risks
+rejecting valid addresses. This catches real typos, which is what it's for.
 
-- **Email: stored as-given, deduplicated case-insensitively.** `BHARATH.KUMAR@EXAMPLE.COM`
-  isn't lowercased on the way in — original casing is kept for display — but uniqueness
-  is enforced with `CREATE UNIQUE INDEX ... ON users (email COLLATE NOCASE)`, the exact
-  same fix as Q1's title dedup. `NOCASE` only folds ASCII, which was a real limitation
-  in Q1 (Italian/Indonesian titles), but isn't one here — email local-parts and domains
-  are ASCII by construction, even José's (`jose.fernandes@example.com`).
-- **Whitespace: stripped, not preserved.** Unlike Q1's `NULL`, incidental padding around
-  an email carries no information — `"  x  "` and `"x"` are the same value, and stripping
-  is what lets the later `@`-count check work correctly on Chitra's row at all.
-- **Missing email is fatal; missing name is not.** Email is the natural key — a row with
-  no email can't be identified or contacted, so it's rejected outright. A name is a
-  label, not an identity; Ganesh's row (empty name, valid email) is stored with `NULL`
-  name rather than thrown away, since the useful, keyable half of the record is intact.
-- **Malformed email: "exactly one `@`, non-empty on both sides."** Not RFC 5322 — that's
-  famously near-impossible to get right with a regex — but a rule that catches a real
-  typo (`elango.example.com`) without inventing rules the task doesn't ask for (no
-  domain/TLD format checking, no length limits).
-- **Ragged row: rejected, not silently ignored.** `restkey="extra"` surfaces Janani's
-  phone number as `row["extra"] = ['9876543210']` instead of raising. Dropping the extra
-  field silently would hide a possible schema mismatch in the source file; rejecting and
-  reporting it keeps that visible.
+*Ragged rows* are rejected rather than truncated. `DictReader(restkey="extra")` surfaces
+the surplus fields, but an unexpected column count means the row's structure doesn't
+match the header, and silently discarding the extra assumes the first two fields are the
+right ones.
 
-## Results
+*Duplicate emails* are handled by a case-insensitive unique constraint, since email
+addresses are case-insensitive in practice.
 
-First run, fresh `users.db`:
+Worth being precise about how I verified that last one: my fixture had an uppercase
+email but nothing colliding with it, so the dedup path was never actually exercised by
+the test data. Rather than assume it worked, I manually inserted a lowercase variant of
+the existing address and confirmed it was rejected with rowcount 0.
 
-```
-Read 11 rows, 8 valid, 3 rejected
-  line 6: {'name': 'Elango S', 'email': 'elango.example.com'} -> malformed email
-  line 7: {'name': 'Fathima Begum', 'email': ''} -> missing email
-  line 11: {'name': 'Janani P', 'email': 'janani.p@example.com', 'extra': ['9876543210']} -> unexpected extra field(s): ['9876543210']
-1 valid row(s) accepted with no name
+**stdlib over pandas**
 
-7 inserted, 1 skipped as duplicates
-7 total rows now in users.db
-```
+`pandas.read_csv().to_sql()` does this in two lines. I used `csv` and `sqlite3` because
+this task needs per-row rejection with reasons, which means touching each row
+individually anyway — and the stdlib streams rather than loading the file into memory,
+with no dependency.
 
-The 1 skipped duplicate is Aarthi's exact repeat (line 10 vs line 2).
+I'd flip for a large analytics-shaped CSV, where `chunksize` handles files bigger than
+RAM cleanly and dtype inference and vectorised operations earn the dependency. The
+deciding factor is whether you need row-level control or column-level throughput.
 
-Second run, same `users.db`, no changes to the CSV:
+**Known limitations**
 
-```
-0 inserted, 8 skipped as duplicates
-7 total rows now in users.db
-```
+- `COLLATE NOCASE` folds ASCII only. Email addresses are ASCII in practice, so this is
+  safe here in a way it wasn't in Q1's book titles.
+- Email validation is structural, not deliverable — `a@b` passes.
+- Rows with an email but no name are accepted, which is a deliberate choice about what
+  identifies a record, not an oversight.
+- Rejections are printed rather than written to a rejects file, which is what a real
+  import would do so the source data could be corrected and re-run.
+- Non-ASCII names displayed as mojibake in my terminal; checking the bytes confirmed
+  they were stored correctly as UTF-8 (`b'Jos\xc3\xa9 Fernandes'`). That's a terminal
+  encoding default on Windows, not a data problem — but it's the reason to verify at
+  byte level rather than trusting the screen.
+- No test suite; all verification was manual.
 
-Idempotent — confirms the dedup index actually works, not just on the first pass.
-
-Manual test for the case collision the fixture itself doesn't contain: inserted
-`bharath.kumar@example.com` (lowercase) against the already-stored
-`BHARATH.KUMAR@EXAMPLE.COM`.
-
-```
-rows inserted for the lowercase variant (should be 0): 0
-all Bharath rows now in the table: [('BHARATH.KUMAR@EXAMPLE.COM',)]
-```
-
-Rejected as a duplicate, original casing preserved — the `NOCASE` index catches a case
-collision this specific fixture never actually produced on its own.
-
-One more thing worth recording: querying José's stored name back showed `Jos� Fernandes`
-in this terminal. Checked the actual bytes rather than trusting the display:
-`name.encode('utf-8')` gives `b'Jos\xc3\xa9 Fernandes'` — correct UTF-8 for "José
-Fernandes". The mangling is this Windows terminal's rendering, not corrupted data — same
-class of issue as the em dash in Q1's output.
-
-## Why stdlib instead of `pandas.read_csv().to_sql()`
-
-That's a real two-line alternative, and worth naming rather than pretending it doesn't
-exist. I didn't use it because this task wants **row-level control over rejections** —
-`to_sql()` either writes a row or the whole call fails, it doesn't let you say "these 3
-rows were rejected, here's why, here's the line number." `csv.DictReader` streams
-row-by-row rather than loading the whole file into memory (`read_users` does return a
-list up front for simplicity here, so this file doesn't get that benefit in full — it
-would for a much larger CSV processed as a generator instead), and it's zero
-dependencies for an 11-row name/email import. I'd flip to `pandas` for a large,
-analytics-shaped CSV — wide, numeric, meant for aggregation — where `chunksize` and
-dtype handling earn the dependency; a validation-heavy, narrow user import is exactly
-the case stdlib is proportionate for.
-
-## Known limitations
-
-- `read_users` materializes the whole file into a list before validation runs, so the
-  "streaming" argument above only fully holds if it's changed to yield rows lazily —
-  fine at 11 rows, not a guarantee at import sizes where memory actually matters.
-- Malformed-email checking is intentionally shallow: `a@b` passes even though `b` isn't
-  a real domain. That's a deliberate line, not an oversight, but worth stating plainly.
-- No normalization beyond stripping whitespace — `José` and a hypothetical accent-stripped
-  `Jose` would be stored as different names, same as Q1's author-casing limitation.
-- No automated tests; verified by hand against the fixture, same as Q1 and Q2.
-
-## How to run
+**How to run**
 
 ```bash
 python make_fixture.py   # writes users.csv
